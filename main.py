@@ -14,7 +14,8 @@ from pathlib import Path
 from openai import OpenAI
 
 BATCH_SIZE = 15
-MODEL = "meta/llama-3.2-3b-instruct"
+DEFAULT_OLLAMA_MODEL = "llama3.2:3b"
+DEFAULT_NIM_MODEL = "meta/llama-3.2-3b-instruct"
 CATEGORIES = [
     "Technology",
     "Science",
@@ -212,7 +213,7 @@ def sanitize_json_output(text: str) -> str:
 
 
 def process_batch_with_ai(
-    client: OpenAI, bookmarks: list[Bookmark], rate_limiter: RateLimiter | None = None
+    client: OpenAI, model: str, bookmarks: list[Bookmark], rate_limiter: RateLimiter | None = None
 ) -> dict[str, dict[str, str]]:
     lines = []
     for idx, bm in enumerate(bookmarks, 1):
@@ -223,14 +224,13 @@ def process_batch_with_ai(
         rate_limiter.acquire()
 
     response = client.chat.completions.create(
-        model=MODEL,
+        model=model,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": "Bookmarks:\n" + "\n".join(lines)},
         ],
         temperature=0.2,
         max_tokens=4096,
-        response_format={"type": "json_object"},
     )
 
     raw = response.choices[0].message.content or "{}"
@@ -252,6 +252,8 @@ def enrich_bookmarks_with_ai(
     bookmarks: list[Bookmark],
     cache_path: Path,
     client: OpenAI,
+    model: str,
+    use_local: bool = False,
 ) -> None:
     cache = load_cache(cache_path)
     uncached: list[Bookmark] = []
@@ -270,14 +272,14 @@ def enrich_bookmarks_with_ai(
     print(f"AI enrichment needed for {len(uncached)} bookmarks (cached: {len(bookmarks) - len(uncached)})")
 
     total_batches = (len(uncached) + BATCH_SIZE - 1) // BATCH_SIZE
-    rate_limiter = RateLimiter(max_requests=40, window_seconds=60.0)
+    rate_limiter = RateLimiter(max_requests=40, window_seconds=60.0) if not use_local else None
 
     def _process_one_batch(args: tuple[int, list[Bookmark]]) -> tuple[int, dict[str, dict[str, str]] | None]:
         batch_num, batch = args
         print(f"Processing AI batch {batch_num}/{total_batches} ({len(batch)} bookmarks)...")
         for attempt in range(1, 4):
             try:
-                return batch_num, process_batch_with_ai(client, batch, rate_limiter)
+                return batch_num, process_batch_with_ai(client, model, batch, rate_limiter)
             except Exception as e:
                 print(f"Warning: AI batch {batch_num} failed (attempt {attempt}/3): {e}")
                 if attempt < 3:
@@ -382,16 +384,34 @@ def render_html(folder: Folder) -> str:
     return "\n".join(lines) + "\n"
 
 
-def get_ai_client() -> OpenAI:
+def get_ai_client() -> tuple[OpenAI, str, bool]:
+    ollama_host = os.environ.get("OLLAMA_HOST", "")
+    if ollama_host:
+        model = os.environ.get("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
+        print(f"Using Ollama at {ollama_host} with model {model}")
+        client = OpenAI(
+            base_url=f"{ollama_host.rstrip('/')}/v1",
+            api_key="ollama",
+            timeout=300.0,
+            max_retries=2,
+        )
+        return client, model, True
+
     key = os.environ.get("NVIDIA_API_KEY", "")
     if not key:
-        raise RuntimeError("NVIDIA_API_KEY environment variable not set")
-    return OpenAI(
+        raise RuntimeError(
+            "No AI provider configured. Set either:\n"
+            "  OLLAMA_HOST=http://localhost:11434  (for local Ollama)\n"
+            "  NVIDIA_API_KEY=nvapi-...            (for NVIDIA NIM cloud)"
+        )
+    print(f"Using NVIDIA NIM with model {DEFAULT_NIM_MODEL}")
+    client = OpenAI(
         base_url="https://integrate.api.nvidia.com/v1",
         api_key=key,
         timeout=120.0,
         max_retries=2,
     )
+    return client, DEFAULT_NIM_MODEL, False
 
 
 def process_bookmarks(
@@ -407,8 +427,8 @@ def process_bookmarks(
     if use_ai:
         if cache_path is None:
             cache_path = Path(".bookmark_cache.json")
-        client = get_ai_client()
-        enrich_bookmarks_with_ai(unique_bms, cache_path, client)
+        client, model, use_local = get_ai_client()
+        enrich_bookmarks_with_ai(unique_bms, cache_path, client, model, use_local)
         new_root = build_ai_folder_tree(unique_bms)
     else:
         new_root = build_fallback_tree(unique_bms)
@@ -433,8 +453,10 @@ if __name__ == "__main__":
     if not args:
         print("Usage: python main.py <input_bookmarks.html> [output_bookmarks.html]")
         print("")
-        print("Environment variable required for AI mode:")
-        print("  NVIDIA_API_KEY=nvapi-...")
+        print("Environment variables for AI mode (provide one):")
+        print("  OLLAMA_HOST=http://localhost:11434   (local Ollama, default model: llama3.2:3b)")
+        print("  OLLAMA_MODEL=...                     (optional: override Ollama model)")
+        print("  NVIDIA_API_KEY=nvapi-...             (NVIDIA NIM cloud)")
         print("")
         print("Options:")
         print("  --no-ai    Skip AI enrichment, just deduplicate and sort")
