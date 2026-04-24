@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import concurrent.futures
 import html
 import json
 import os
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
@@ -11,7 +13,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
-BATCH_SIZE = 15
+BATCH_SIZE = 30
 MODEL = "meta/llama-3.2-3b-instruct"
 CATEGORIES = [
     "Technology",
@@ -114,9 +116,7 @@ class BookmarkParser(HTMLParser):
                 title=html.unescape(self._current_bookmark["title"]).strip(),
                 add_date=self._current_bookmark.get("add_date", ""),
                 icon=self._current_bookmark.get("icon", ""),
-                original_path=[f.name for f in self._folder_stack[:-1]]
-                if len(self._folder_stack) > 1
-                else [],
+                original_path=[f.name for f in self._folder_stack],
             )
             if self._folder_stack:
                 self._folder_stack[-1].children.append(bm)
@@ -178,6 +178,28 @@ def save_cache(cache_path: Path, cache: dict[str, dict[str, str]]) -> None:
     cache_path.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
+class RateLimiter:
+    def __init__(self, max_requests: int, window_seconds: float) -> None:
+        self.max_requests = max_requests
+        self.window_seconds = window_seconds
+        self._timestamps: list[float] = []
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        with self._lock:
+            now = time.time()
+            cutoff = now - self.window_seconds
+            self._timestamps = [t for t in self._timestamps if t > cutoff]
+            if len(self._timestamps) >= self.max_requests:
+                sleep_time = self._timestamps[0] + self.window_seconds - now
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                    now = time.time()
+                    cutoff = now - self.window_seconds
+                    self._timestamps = [t for t in self._timestamps if t > cutoff]
+            self._timestamps.append(now)
+
+
 def sanitize_json_output(text: str) -> str:
     text = text.strip()
     if text.startswith("```json"):
@@ -189,11 +211,16 @@ def sanitize_json_output(text: str) -> str:
     return text.strip()
 
 
-def process_batch_with_ai(client: OpenAI, bookmarks: list[Bookmark]) -> dict[str, dict[str, str]]:
+def process_batch_with_ai(
+    client: OpenAI, bookmarks: list[Bookmark], rate_limiter: RateLimiter | None = None
+) -> dict[str, dict[str, str]]:
     lines = []
     for idx, bm in enumerate(bookmarks, 1):
         safe_title = bm.title.replace("|", "/").replace("\n", " ")
         lines.append(f"{idx}. URL: {bm.url} | Title: {safe_title}")
+
+    if rate_limiter is not None:
+        rate_limiter.acquire()
 
     response = client.chat.completions.create(
         model=MODEL,
@@ -202,7 +229,7 @@ def process_batch_with_ai(client: OpenAI, bookmarks: list[Bookmark]) -> dict[str
             {"role": "user", "content": "Bookmarks:\n" + "\n".join(lines)},
         ],
         temperature=0.2,
-        max_tokens=2048,
+        max_tokens=4096,
         response_format={"type": "json_object"},
     )
 
@@ -243,32 +270,44 @@ def enrich_bookmarks_with_ai(
     print(f"AI enrichment needed for {len(uncached)} bookmarks (cached: {len(bookmarks) - len(uncached)})")
 
     total_batches = (len(uncached) + BATCH_SIZE - 1) // BATCH_SIZE
-    for i in range(0, len(uncached), BATCH_SIZE):
-        batch = uncached[i : i + BATCH_SIZE]
-        batch_num = i // BATCH_SIZE + 1
-        print(f"Processing AI batch {batch_num}/{total_batches} ({len(batch)} bookmarks)...")
+    rate_limiter = RateLimiter(max_requests=40, window_seconds=60.0)
 
+    def _process_one_batch(args: tuple[int, list[Bookmark]]) -> tuple[int, dict[str, dict[str, str]] | None]:
+        batch_num, batch = args
+        print(f"Processing AI batch {batch_num}/{total_batches} ({len(batch)} bookmarks)...")
         try:
-            results = process_batch_with_ai(client, batch)
-            for bm in batch:
-                normalized = bm.url.rstrip("/").lower()
-                if normalized in results:
-                    bm.ai_name = results[normalized]["name"]
-                    bm.ai_category = results[normalized]["category"]
-                    cache[normalized] = results[normalized]
-                else:
-                    bm.ai_name = bm.title
-                    bm.ai_category = "Other"
-                    cache[normalized] = {"name": bm.title, "category": "Other"}
-            save_cache(cache_path, cache)
+            return batch_num, process_batch_with_ai(client, batch, rate_limiter)
         except Exception as e:
             print(f"Warning: AI batch {batch_num} failed: {e}")
-            for bm in batch:
-                bm.ai_name = bm.title
-                bm.ai_category = "Other"
+            return batch_num, None
 
-        if batch_num < total_batches:
-            time.sleep(1.5)
+    batches = [
+        (i // BATCH_SIZE + 1, uncached[i : i + BATCH_SIZE])
+        for i in range(0, len(uncached), BATCH_SIZE)
+    ]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(_process_one_batch, b) for b in batches]
+        for future in concurrent.futures.as_completed(futures):
+            batch_num, results = future.result()
+            batch = batches[batch_num - 1][1]
+            if results is not None:
+                for bm in batch:
+                    normalized = bm.url.rstrip("/").lower()
+                    if normalized in results:
+                        bm.ai_name = results[normalized]["name"]
+                        bm.ai_category = results[normalized]["category"]
+                        cache[normalized] = results[normalized]
+                    else:
+                        bm.ai_name = bm.title
+                        bm.ai_category = "Other"
+                        cache[normalized] = {"name": bm.title, "category": "Other"}
+            else:
+                for bm in batch:
+                    bm.ai_name = bm.title
+                    bm.ai_category = "Other"
+
+    save_cache(cache_path, cache)
 
 
 def build_ai_folder_tree(bookmarks: list[Bookmark]) -> Folder:
@@ -293,7 +332,7 @@ def build_fallback_tree(bookmarks: list[Bookmark]) -> Folder:
     groups: dict[str, list[Bookmark]] = {}
 
     for bm in bookmarks:
-        key = bm.original_path[0] if bm.original_path else "Uncategorized"
+        key = bm.original_path[-1] if bm.original_path else "Uncategorized"
         groups.setdefault(key, []).append(bm)
 
     for folder_name, items in sorted(groups.items()):
@@ -344,7 +383,12 @@ def get_ai_client() -> OpenAI:
     key = os.environ.get("NVIDIA_API_KEY", "")
     if not key:
         raise RuntimeError("NVIDIA_API_KEY environment variable not set")
-    return OpenAI(base_url="https://integrate.api.nvidia.com/v1", api_key=key)
+    return OpenAI(
+        base_url="https://integrate.api.nvidia.com/v1",
+        api_key=key,
+        timeout=60.0,
+        max_retries=1,
+    )
 
 
 def process_bookmarks(
