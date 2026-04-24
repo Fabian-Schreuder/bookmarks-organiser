@@ -13,7 +13,7 @@ from pathlib import Path
 
 from openai import OpenAI
 
-BATCH_SIZE = 30
+BATCH_SIZE = 15
 MODEL = "meta/llama-3.2-3b-instruct"
 CATEGORIES = [
     "Technology",
@@ -275,18 +275,21 @@ def enrich_bookmarks_with_ai(
     def _process_one_batch(args: tuple[int, list[Bookmark]]) -> tuple[int, dict[str, dict[str, str]] | None]:
         batch_num, batch = args
         print(f"Processing AI batch {batch_num}/{total_batches} ({len(batch)} bookmarks)...")
-        try:
-            return batch_num, process_batch_with_ai(client, batch, rate_limiter)
-        except Exception as e:
-            print(f"Warning: AI batch {batch_num} failed: {e}")
-            return batch_num, None
+        for attempt in range(1, 4):
+            try:
+                return batch_num, process_batch_with_ai(client, batch, rate_limiter)
+            except Exception as e:
+                print(f"Warning: AI batch {batch_num} failed (attempt {attempt}/3): {e}")
+                if attempt < 3:
+                    time.sleep(2 ** attempt)
+        return batch_num, None
 
     batches = [
         (i // BATCH_SIZE + 1, uncached[i : i + BATCH_SIZE])
         for i in range(0, len(uncached), BATCH_SIZE)
     ]
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         futures = [executor.submit(_process_one_batch, b) for b in batches]
         for future in concurrent.futures.as_completed(futures):
             batch_num, results = future.result()
@@ -386,8 +389,8 @@ def get_ai_client() -> OpenAI:
     return OpenAI(
         base_url="https://integrate.api.nvidia.com/v1",
         api_key=key,
-        timeout=60.0,
-        max_retries=1,
+        timeout=120.0,
+        max_retries=2,
     )
 
 
