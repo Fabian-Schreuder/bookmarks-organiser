@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.python-version
+.bookmark_cache.json
+*.html
+!README.md
